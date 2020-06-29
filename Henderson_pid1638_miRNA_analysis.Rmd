@@ -1,0 +1,1468 @@
+---
+title: Analysis of miRNA-Seq data for the Henderson lab
+author: James W. MacDonald
+output:
+   BiocStyle::html_document:
+       toc_float: true
+       css: style.css
+bibliography: Statistical_analysis.bib
+
+---
+
+
+
+```{r, include = FALSE}
+
+library(knitr)
+opts_chunk$set(echo=FALSE, fig.path='pdfs/Statistical_analysis')
+opts_knit$set(eval.after = "fig.cap")
+
+library(edgeR)
+library(openxlsx)
+library(reshape2)
+library(ggplot2)
+library(affycoretools)
+library(BiocStyle)
+library(xtable)
+library(Glimma)
+library(sva)
+library(splines)
+library(hwriter)
+library(ComplexHeatmap)
+library(scales)
+library(miRNAtap)
+library(Roleswitch)
+library(org.Hs.eg.db)
+library(RCurl)
+library(XML)
+library(readr)
+library(ggthemes)
+
+
+doGlimma <- function(tablst, datobj, dsgn, cont, sampdf, grpvec, padj = "BH", sigfilt = 0.05, sampname = "Samples", extraname = NULL,...){
+    if(!sampname %in% colnames(sampdf))
+        stop(paste("Please provide the column name containing sample IDs in", deparse(substitute(sampdf))), call. = FALSE)
+
+    counts <- switch(class(datobj),
+                     DGEList = datobj$counts,
+                     ExpressionSet = exprs(datobj),
+                     EList = datobj$E,
+                     stop("Please use either a DGEList, ExpressionSet or EList object for the datobj argument.", call. = FALSE))
+
+    for(i in seq_len(ncol(contrast))){
+        folder <- if(is.null(extraname)) "glimma-plots" else paste0("glimma-plots/", extraname)
+        if(!file.exists(folder)) dir.create(folder, recursive = TRUE)
+        html <- gsub(" ", "_", colnames(contrast))
+        ind <- as.logical(design %*% contrast[,i])
+        if(is(tablst[[i]], "DGELRT") | is(tablst[[i]],"DGEExact")){
+            tt <- topTags(tablst[[i]], Inf, sort.by = "n", adjust.method = padj)$table
+            status <- as.numeric(tt[,ncol(tt)] < sigfilt)
+            glMDPlot(tablst[[i]], counts = counts[,ind], groups = factor(grpvec[ind]), status = status,
+                     samples = sampdf[ind, sampname], transform = TRUE, folder = folder,
+                     html = html[i], launch = FALSE, main = colnames(cont)[i],...)
+        } else if(is(tablst, "MArrayLM")) {
+            tt <- topTable(tablst, i, Inf, sort.by = "n", adjust.method = padj)
+            status <- as.numeric(tt[,"adj.P.Val"] < sigfilt)
+            glMDPlot(tablst[,i], counts = counts[,ind], groups = factor(grpvec[ind]), status = status,
+                     samples = sampdf[ind, sampname], transform = FALSE, folder = folder,
+                     html = html[i], launch = FALSE, main = colnames(cont)[i],...)
+        } else {
+            stop("Please provide either a DGELRT, DGExact or MArrayLM object!", call. = FALSE)
+        }
+    }
+    return(paste0(paste(folder, html, sep = "/"), ".html"))
+}
+
+
+
+
+## usually better to read in samps file first to keep things correctly ordered
+samps <- read.xlsx("../../19.05.01_pid1638_MSD/bioconductor/Henderson_pid1638_samples.xlsx")
+samps <- samps[samps$Day == 0L,]
+samps$subj <- paste0("#", sprintf("%03d", as.numeric(sapply(strsplit(samps$Subject, "\\."), "[", 2))))
+samps2 <- read.xlsx("20646_ Sample ID.xlsx")
+samps2 <- rbind(samps2[,1:2], samps2[,3:4])
+samps2$Qiagen.ID <- sapply(strsplit(samps2$Qiagen.ID, "-"), function(x) paste(x[1], sprintf("%03d", as.numeric(x[2])), sep = "-"))
+samps2$Cell <- ifelse(sapply(strsplit(samps2[,2], ""), function(x) x[length(x)]) == "B", "Basophil","Exosomes")
+samps2[,2] <- gsub("E$|B$", "", samps2[,2])
+samps2$Subject <- as.numeric(gsub("^#| V[1-9]$", "", samps2[,2]))
+samps3 <- read.xlsx("Henderson PID1638.xlsx" , 2)[,1,drop = FALSE]
+samps3 <- do.call(rbind, strsplit(samps3[,1], "/"))
+samps2$Day <- samps3[match(samps2[,2], samps3[,1]),2]
+samps2$Outcome <- samps[match(gsub(" V[1-9]$", "", samps2$Cust.ID), samps$subj),"AUCresp"]
+samps2$Outcome <- ifelse(samps2$Outcome == "NR", "NR", "CR")
+samps2$AdjDay <- rep(c("Day1","Day14","Day90"), times = nrow(samps2)/3)
+samps2$combo <- paste(samps2$Outcome, samps2$AdjDay)
+samps2$SubjectCombo <- paste("Subject", samps2$Subject, samps2$combo)
+
+
+exosamps <- samps2[samps2$Cell == "Exosomes",]
+basosamps <- samps2[samps2$Cell != "Exosomes",]
+
+baso <- read.xlsx("../data/20646-merged_34-66-all_samples.summary.xlsx", 2)
+exo <- read.xlsx("../data/20646-merged _1-33_all_samples.summary.xlsx", 2)
+
+## fix piR names
+fixPir <- function(df){
+    pirind <- grep("piR", df[,1])
+    pirs <- as.character(df[pirind,1])
+    pirs <- sapply(strsplit(pirs, "/"), "[", 1)
+    pirlst <- do.call(rbind, strsplit(pirs, "_"))
+    pirs <- paste(pirlst[,2], pirlst[,1], as.numeric(pirlst[,3]), sep = "-")
+    out <- as.character(df[,1])
+    out[pirind] <- pirs
+    out
+}
+    
+
+baso <- baso[,c(1, grep("UMIs", names(baso)))]
+names(baso) <- gsub("_S[0-9]+-UMIs", "", names(baso))
+baso <- baso[,c(1,match(basosamps[,1], names(baso)[-1])+1)]
+
+exo <- exo[,c(1, grep("UMIs$", names(exo)))]
+names(exo) <- gsub("_S[0-9]+-UMIs", "", names(exo))
+exo <- exo[,c(1,match(exosamps[,1], names(exo)[-1])+1)]
+
+basoind <- apply(baso, 1, function(x) any(is.na(x)))
+basodg <- DGEList(baso[!basoind,-1], genes = fixPir(baso[!basoind,]))
+
+exoind <- apply(exo, 1, function(x) any(is.na(x)))
+exodg <- DGEList(exo[!exoind,-1], genes = fixPir(exo[!exoind,]))
+
+## change two miRNA IDs
+## Theo decided we shouldn't do this
+
+## exodg$genes[match(c("hsa-miR-8485","hsa-miR-6877-3p"), exodg$genes[,1]),] <- c("miR-669c-3p", "miR-6819-3p")
+## basodg$genes[match(c("hsa-miR-8485","hsa-miR-6877-3p"), basodg$genes[,1]),] <- c("miR-669c-3p", "miR-6819-3p")
+
+################################ 2020-01-15 ###############################
+##
+## Taha and Bill want to exclude subject 16, so we do that here
+##
+####################################################################3
+
+ind16 <- !basosamps$Subject %in% 16
+basosamps <- basosamps[ind16,]
+exosamps <- exosamps[ind16,]
+basodg <- basodg[,ind16]
+exodg <- exodg[,ind16]
+
+## design and contrast
+design <- model.matrix(~0 + combo, basosamps)
+colnames(design) <- gsub("combo", "", colnames(design))
+
+contrast <- matrix(c(1,0,0,-1,0,0,
+                     0,1,0,0,-1,0,
+                     0,0,1,0,0,-1,
+                     1,-1,0,0,0,0,
+                     1,0,-1,0,0,0,
+                     0,1,-1,0,0,0,
+                     0,0,0,1,-1,0,
+                     0,0,0,1,0,-1,
+                     0,0,0,0,1,-1),
+                    ncol = 9)
+colnames(contrast) <- paste(colnames(design)[apply(contrast, 2, function(x) which(x > 0))],
+                            colnames(design)[apply(contrast, 2, function(x) which(x < 0))],
+                            sep = " vs ")
+
+## filter
+exokeep <- filterByExpr(exodg, design)
+basokeep <- filterByExpr(basodg, design)
+
+exodg <- exodg[exokeep,,keep.lib.sizes = FALSE]
+basodg <- basodg[basokeep,,keep.lib.sizes = FALSE]
+
+exodg <- calcNormFactors(exodg)
+basodg <- calcNormFactors(basodg)
+
+
+ve <- voomWithQualityWeights(exodg, design)
+exdup <- duplicateCorrelation(ve, design, block = exosamps$Subject)
+ve <- voomWithQualityWeights(exodg, design, correlation = exdup$consensus)
+exdup <- duplicateCorrelation(ve, design, block = exosamps$Subject)
+
+exvfit <- lmFit(ve, design, block =  exosamps$Subject, correlation = exdup$consensus)
+exvfit2 <- contrasts.fit(exvfit, contrast)
+exvfit2 <- eBayes(exvfit2)
+
+vb <- voomWithQualityWeights(basodg, design)
+basdup <- duplicateCorrelation(vb, design, block = basosamps$Subject)
+vb <- voomWithQualityWeights(basodg, design, correlation = basdup$consensus)
+basdup <- duplicateCorrelation(vb, design, block = basosamps$Subject)
+
+basvfit <- lmFit(vb, design, block =  basosamps$Subject, correlation = basdup$consensus)
+basvfit2 <- contrasts.fit(basvfit, contrast)
+basvfit2 <- eBayes(basvfit2)
+
+veplot <- removeBatchEffect(ve, basosamps$Subject)
+row.names(veplot) <- ve$genes[,1]
+
+vbplot <- removeBatchEffect(vb, basosamps$Subject)
+row.names(vbplot) <- vb$genes[,1]
+
+
+## ingenuity
+wb <- createWorkbook()
+addWorksheet(wb, "IPA_data")
+addWorksheet(wb, "observation_weights")
+addWorksheet(wb, "samples")
+tmp <- ve$weights
+colnames(tmp) <- exosamps[,1]
+writeData(wb, "IPA_data", writeFit(exvfit2, NULL, ve$E))
+writeData(wb, "observation_weights", tmp)
+writeData(wb, "samples", exosamps)
+saveWorkbook(wb, "Henderson_pid1638_miRNA_exosome_ingenuity.xlsx", TRUE)
+wb <- createWorkbook()
+addWorksheet(wb, "IPA_data")
+addWorksheet(wb, "observation_weights")
+addWorksheet(wb, "samples")
+tmp <- vb$weights
+colnames(tmp) <- basosamps[,1]
+writeData(wb, "IPA_data", writeFit(basvfit2, NULL, vb$E))
+writeData(wb, "observation_weights", tmp)
+writeData(wb, "samples", basosamps)
+saveWorkbook(wb, "Henderson_pid1638_miRNA_basophil_ingenuity.xlsx", TRUE)
+
+
+
+
+glMDSPlot(exodg, groups = exosamps[,c(4:7)], gene.selection = "common", main = "PCA Plot, Exosomes", html = "MDS-Plot_exosomes", launch = FALSE)
+glMDSPlot(basodg, groups = basosamps[,c(4:7)], gene.selection = "common", main = "PCA Plot, Basophils", html = "MDS-Plot_basophils", launch = FALSE)
+
+## MDS plots after removing subject
+glMDSPlot(removeBatchEffect(cpm(exodg, log = TRUE), exosamps$Subject),
+          groups = exosamps[,c(4:7)], gene.selection = "common", main = "PCA Plot, Exosomes, adjusted for patient",
+          html = "MDS-Plot_exosomes_adjusted", launch = FALSE)
+
+glMDSPlot(removeBatchEffect(cpm(basodg, log = TRUE), basosamps$Subject),
+          groups = basosamps[,c(4:7)], gene.selection = "common", main = "PCA Plot, Basophils, adjusted for patient",
+          html = "MDS-Plot_basophils_adjusted", launch = FALSE)
+
+exorslts <- doGlimma(exvfit2, ve, design, contrast, exosamps, exosamps$combo,
+                     sigfilt = 0.1, sampname = "SubjectCombo", extraname = "Exosomes")
+
+basorslts <- doGlimma(basvfit2, vb, design, contrast, basosamps, basosamps$combo,
+                      sigfilt = 0.1, sampname = "SubjectCombo", extraname = "Basophils")
+
+
+#################3 Extra Stuff #########################3
+
+## probably need a function for this. Taha wants to plot UAS7 score vs time
+## segregated by miRNA expression level (high, low).
+
+## UAS7 data
+
+uas<- read.xlsx("../../19.05.01_pid1638_MSD/bioconductor/Copy of graphs and data UAS with itch scores.xlsx", "UAS7-", cols = 5:30, rows = 24:37)
+uas <- uas[,c("Week", paste0("Subject.", unique(basosamps$Subject)))]
+
+cutNPlot <- function(sampsdf, vobj, uasdat, topdf, points = TRUE){
+    gns <- row.names(topdf)
+    vdat <- vobj$E[gns, grep("CR Day1$|NR Day1$", sampsdf$combo)]
+    vcuts <- apply(vdat, 1, function(x) ifelse(x < median(x, na.rm = TRUE), "low","high")) 
+    ggdat <- do.call(rbind, lapply(seq(along = gns), function(x) data.frame(Week = rep(uas$Week, ncol(uas)-1),
+                                                                            miRval = vdat[x,][col(uas[,-1])],
+                                                                            Expression = vcuts[,x][col(uas[,-1])],
+                                                                            value = unlist(uas[,-1]),
+                                                                            miRNA = rep(as.character(topdf$genes)[x], length(as.vector(uas[,-1]))))))
+    g <- ggplot(ggdat, aes(Week, value, colour = Expression)) + 
+        stat_smooth(method = "lm", formula = y~ns(x, 2)) + facet_wrap(~miRNA) +
+        ylab("UAS7")
+    if(points)
+        g <- g + geom_point()
+    g
+}
+
+## UA7 vs miR
+
+uas2 <- unlist(uas[c(1,3,13),-1])
+basosamps$uas <- uas2
+exosamps$uas <- uas2
+
+makePlots <- function(sampdf, vobj, fitobj, contnames, samptype){
+    for(i in seq(along = contnames)){
+        pdf(paste0("pdfs/", samptype, "_", gsub(" ", "_", contnames[i]), ".pdf"))
+        tt <- topTable(fitobj, i)
+        for(j in seq_len(nrow(tt))){
+            makePlot(tt, j, sampdf, vobj, fitobj, TRUE)
+        }
+        dev.off()
+    }
+}
+
+
+makePlot <- function(toptab, whichone, sampdf, vobj, fitobj, pdf = FALSE){
+    z <- data.frame(sampdf, miR = vobj$E[row.names(toptab)[whichone],])
+    z <- do.call(rbind, lapply(split(z, z$Outcome), function(x) {x$pt <- rep(1:(nrow(x)/3), each = 3); return(x)}))
+    z$pt <- factor(z$pt)
+    contrasts(z$pt) <- contr.sum(levels(z$pt))
+    sumry <- summary(lm(miR~uas + Outcome:pt + Outcome*uas, z))
+    coefs <- sumry$coef
+    op <- par(no.readonly = TRUE)
+    addit <- if(pdf) c(0,0,0,3) else c(0,0,0,5) 
+    par(mar = par()$mar + addit)
+    xbatch <- model.matrix(~uas + Outcome:pt + Outcome*uas, z)
+    z$corr <- t(z$miR - coefs[4:(nrow(coefs) - 1),1] %*% t(xbatch[,4:(nrow(coefs) - 1)]))
+    plot(corr~uas, z, pch = 16, col = as.numeric(factor(z$Outcome)),
+         xlab = "UAS7", ylab = as.character(toptab[whichone,1]))
+    abline(coefs[1,1], coefs[2,1])
+    abline(coefs[1,1]+ coefs[3,1], coefs[2,1] + coefs[nrow(coefs),1], col = "red")
+    par(xpd = TRUE)
+    rsq <- round(sumry$adj.r.squared, 2)
+    legend("topright", c("CR","NR"), pch = 16, lty = 1, col = 1:2, inset = c(-0.2, 0), bty = "n")
+    lst <- list(bquote("CR" ~ beta == .(round(coefs[2,1],2))),
+                paste("CR p =", round(coefs[2,4],2)),
+                bquote("NR" ~ beta  == .(round(coefs[nrow(coefs),1] + coefs[2,1], 2))),
+                paste("NR p =", round(coefs[nrow(coefs),4], 2)),
+                bquote(R^2 == .(rsq)))
+    legend("right", legend = do.call(expression, lst), inset = c(-0.2,0), bty = "n", text.col = rep(c(1,2,1), c(2,2,1)))
+    par(op)
+}
+
+makePlots(exosamps, ve, exvfit2, colnames(contrast), "exosomes")
+makePlots(basosamps, vb, basvfit2, colnames(contrast), "basophils")
+
+makePlot2 <- function(toptab, whichone, sampdf, vobj, fitobj, pdf = FALSE){
+    z <- data.frame(sampdf, miR = vobj$E[row.names(toptab)[whichone],])
+    z$Subject <- factor(z$Subject)
+    contrasts(z$Subject) <- contr.sum(levels(z$Subject))
+    sumry <- summary(lm(miR ~ uas + Subject, z))
+    coefs <- sumry$coef
+    op <- par(no.readonly = TRUE)
+    addit <- if(pdf) c(0,0,0,3) else c(0,0,0,5) 
+    par(mar = par()$mar + addit)
+    xbatch <- model.matrix(~uas + Subject , z)
+    z$corr <- t(z$miR - coefs[3:ncol(coefs),1] %*% t(xbatch[,3:ncol(coefs)]))
+    plot(corr~uas, z, pch = 16, col = as.numeric(factor(z$Outcome)),
+         xlab = "UAS7", ylab = as.character(toptab[whichone,1]))
+    abline(coefs[1,1], coefs[2,1])
+    par(xpd = TRUE)
+    rsq <- round(sumry$adj.r.squared, 2)
+    lst <- list(bquote(beta == .(round(coefs[2,1],2))),
+                paste("p =", round(coefs[2,4],2)),
+                bquote(R^2 == .(rsq)))
+    legend("right", legend = do.call(expression, lst), inset = c(-0.2,0), bty = "n", text.col = rep(c(1,2,1), c(2,2,1)))
+    par(op)
+}
+
+makePlots2 <- function(sampdf, vobj, fitobj, contnames, samptype){
+    for(i in seq(along = contnames)){
+        pdf(paste0("pdfs/", samptype, "_", gsub(" ", "_", contnames[i]), "_oneline.pdf"))
+        tt <- topTable(fitobj, i)
+        for(j in seq_len(nrow(tt))){
+            makePlot2(tt, j, sampdf, vobj, fitobj, TRUE)
+        }
+        dev.off()
+    }
+}
+
+makePlots2(exosamps, ve, exvfit2, colnames(contrast), "exosomes")
+makePlots2(basosamps, vb, basvfit2, colnames(contrast), "basophils")
+
+## comparisons to mRNA data
+
+runRoleswitch <- function(esetobj, vobj, vind, esetcol, vcol){
+    z.o <- vobj$E[vind,vcol, drop = FALSE]
+    row.names(z.o) <- as.character(vobj$genes[vind,1])
+    z.o <- rescale(z.o, c(0, max(z.o)))
+    esetobj <- esetobj[!is.na(fData(esetobj)$SYMBOL),]
+    symb <- fData(esetobj)$SYMBOL
+    esetobj <- rowsum(exprs(esetobj), symb)
+    len <- sapply(split(symb, symb), length)[row.names(esetobj)]
+    esetobj <- esetobj/len
+    x.o <- esetobj[, esetcol, drop = FALSE]
+    seedmat <- makeSeedmat(row.names(z.o), pidat)
+    seedmat <- seedmat[row.names(seedmat) %in% row.names(x.o), , drop = FALSE]
+    z.o <- z.o[row.names(z.o) %in% colnames(seedmat), , drop = FALSE]
+    x.o <- x.o[row.names(x.o) %in% rownames(seedmat), , drop = FALSE]
+    if(nrow(seedmat) == 0L || ncol(seedmat) == 0L) return(NULL)
+    else
+    return(roleswitch(x.o, z.o, seedmat))
+}
+
+## functions to get seedmat using miRNAtap and the piRNA data from below
+
+makeSeedmat <- function(ids, pirnadat){
+    lst <- lapply(ids, function(x) {
+        if(strsplit(x, "-")[[1]][1] == "hsa")
+            getRS(x)
+        else
+            getPir(x, pirnadat)
+    })
+    nr <- unique(do.call(c, lst))
+    out <- matrix(0, length(nr), length(ids),dimnames = list(nr, ids))
+    for(i in seq(along = lst))
+        out[lst[[i]],i] <- 1
+    out
+}
+        
+
+
+getRS <- function(id, ranks = FALSE){
+    val <- suppressWarnings(getPredictedTargets(id, species = "hsa", min_src = 3))
+    if(is.null(val))
+        return(NULL)
+    else {
+        tmp <- suppressMessages(mapIds(org.Hs.eg.db, row.names(val), "SYMBOL", "ENTREZID"))
+        if(ranks)
+            out <- matrix(val[!is.na(tmp),ncol(val)], dimnames = list(tmp[!is.na(tmp)], id))
+        else
+            out <- tmp[!is.na(tmp)]
+        return(out)
+    }
+}
+
+getPir <- function(id, pirnadat){
+    val <- pirnadat[pirnadat[,1] %in% id,]
+    if(nrow(val) == 0L)
+        return(NULL)
+    else
+        return(as.character(val$symbol))
+}
+        
+
+
+## piRNA data - only need this once
+
+if(!file.exists("pidat.Rdata")){
+    pidat <- scan(gzcon(url("http://www.regulatoryrna.org/database/piRNA/download/archive/v2.0/gene/hsa_gene_related_piRNA.txt.gz")),
+                  list("","","",""), sep = "\t")
+    piind <- pidat[[1]] %in% unique(c(vb$genes[,1], ve$genes[,1]))
+    pidat <- do.call(cbind, lapply(pidat, function(x) x[piind]))
+    save(pidat, file = "pidat.Rdata")
+} else {
+    load("pidat.Rdata")
+}
+
+## get mRNA data
+
+eset <- readRDS("../../19.08.26_pid1638_mRNA/bioconductor/eset.rds")
+
+## subset to conform with miRNA
+
+eset <- eset[,as.numeric(gsub("\\#", "", pData(eset)[,1])) %in% unique(basosamps$Subject)]
+
+basmirs <- sapply(1:ncol(contrast), function(x) rownames(topTable(basvfit2, x, Inf, p.value = 0.05)))
+exmirs <- sapply(1:ncol(contrast), function(x) rownames(topTable(exvfit2, x, Inf, p.value = 0.05)))
+
+if(!file.exists("rolst.Rdata")){
+    rolst.baso <- lapply(1:ncol(contrast), function(x) {
+        if(length(basmirs[[x]]) == 0L) 
+            return(NULL)
+        else {
+            inds <- which(basosamps$combo %in% strsplit(colnames(contrast)[x], " vs ")[[1]])
+            return(lapply(inds, function(y) runRoleswitch(eset, vb, basmirs[[x]], y, y)))
+        }
+    })
+    
+    rolst.exo <- lapply(1:ncol(contrast), function(x) {
+        if(length(exmirs[[x]]) == 0L) 
+            return(NULL)
+        else {
+            inds <- which(exosamps$combo %in% strsplit(colnames(contrast)[x], " vs ")[[1]])
+            return(lapply(inds, function(y) runRoleswitch(eset, ve, exmirs[[x]], y, y)))
+        }
+    })
+    save(rolst.baso, rolst.exo, file = "rolst.Rdata")
+} else {
+    load("rolst.Rdata")
+}
+
+       
+
+    
+        
+crOrDay <- function(names){
+    mat <- do.call(rbind, strsplit(names, "\\s+", perl = TRUE))
+    tab <- table(mat[,3], mat[,4])
+    if(nrow(tab) == 1L)
+        ord <- order(mat[,4], as.numeric(mat[,2]))
+    else
+        ord <- order(mat[,3], as.numeric(mat[,2]))
+    ord
+}
+
+
+heatmapFun <- function(rolswitchobj, whichcol, whichsamps, fontsize){
+    require("circlize", character.only = TRUE, quietly = TRUE)
+    colfun <- colorRamp2(c(0,1), c("blue","red"))
+    mat <- do.call(cbind, lapply(rolswitchobj, function(x) x$p.xz[,whichcol]))
+    #if(!any(colSums(mat) > 0)) stop("No interacting genes!\n", call. = FALSE)
+    nam <- colnames(rolswitchobj[[1]]$p.x)[whichcol]
+    colnames(mat) <- whichsamps
+    mat <- mat[,crOrDay(colnames(mat))]
+    mat <- mat[rowSums(mat) > 0, , drop = FALSE]
+    if(nrow(mat) == 0L)
+        return(NULL)
+    else
+        Heatmap(mat, cluster_columns = FALSE, row_names_gp = gpar(fontsize = fontsize), col = colfun, name = nam)
+}
+
+## just make heatmaps in pdfs
+
+##### 2020-01-15 ###########################
+## due to changes in subjects used, this won't work without re-running roleswitch, and since
+## Taha and Bill aren't using these results anyway, we just comment out.
+###############################################
+
+## if(!file.exists("pdfs/exoheatmaps")) dir.create("pdfs/exoheatmaps", recursive = TRUE)
+## if(!file.exists("pdfs/basoheatmaps")) dir.create("pdfs/basoheatmaps", recursive = TRUE)
+
+## for(i in seq(along = exmirs)){
+##     todraw <- lapply(seq(along = exmirs[[i]]), function(x) heatmapFun(rolst.exo[[i]], x, exosamps$SubjectCombo[as.logical(design %*% contrast[,i])], 10))
+##     if(!all(sapply(todraw, is.null))){
+##         pdf(paste0("pdfs/exoheatmaps/", gsub("\\s+", "_", colnames(contrast)[i]), ".pdf"), 8, 8)
+##         for(j in seq(along = todraw))
+##             if(!is.null(todraw[[j]])) draw(todraw[[j]])
+##         dev.off()
+##     }
+## }
+
+## for(i in seq(along = basmirs)){
+##     if(length(basmirs[[i]]) > 0L){
+##         pdf(paste0("pdfs/basoheatmaps/", gsub("\\s+", "_", colnames(contrast)[i]), ".pdf"), 8, 8)
+##         for(j in seq(along = basmirs[[i]])){
+##             todraw <- heatmapFun(rolst.baso[[i]], j, basosamps$SubjectCombo[as.logical(design %*% contrast[,i])], 10)
+##             if(!is.null(todraw)) draw(todraw)
+##         }
+##         dev.off()
+##     }
+## }
+
+
+## ## table of miRNA/mRNA interactions
+## makemiRmRNATab <- function(mirs, pimat){
+##     allsymb <- keys(org.Hs.eg.db, "SYMBOL")
+##     mat <- matrix(0, length(allsymb), length(mirs), dimnames = list(allsymb, mirs))
+##     for(i in seq(along = mirs)){
+##         if(strsplit(mirs[i], "-")[[1]][1] == "hsa"){
+##             tmp <- getRS(mirs[i], TRUE)
+##             if(!is.null(tmp)) mat[row.names(tmp),i] <- tmp[,1]
+##         } else {
+##             tmp <- getPir(mirs[i], pimat)
+##             if(!is.null(tmp)) mat[tmp,i] <- 1
+##         }
+##     }
+##     mat
+## }
+
+## if(!file.exists("Henderson_pid1638_miR_mRNA_mapping.xlsx")) {
+##     allmirs <- unique(c(vb$genes[unlist(basmirs),1], ve$genes[unlist(exmirs),1]))
+##     mirMap <- makemiRmRNATab(allmirs, pidat)
+##     mirMap <- mirMap[rowSums(mirMap) > 0L,]
+##     mirMap2 <- mirMap
+##     is.na(mirMap2) <- mirMap == 0L
+##     write.xlsx(mirMap2, "Henderson_pid1638_miR_mRNA_mapping.xlsx", rowNames = TRUE)
+## }
+
+
+
+##################3 mirDB stuff #####################
+
+## mirdb <- as.data.frame(read_tsv(gzfile("miRDB_v6.0_prediction_result.txt.gz"), col_names = FALSE))
+## theurl <- getURL("http://mirdb.org/FuncMir.html")
+## funcmir <- readHTMLTable(theurl)$table2[,2]
+## funcmir <- unique(as.character(funcmir))
+## funcmir <- funcmir[!funcmir %in% ""]
+## funcmir <- gsub("mir","miR", funcmir)
+
+## lilfun <- function(mirids, mirdbdf, cutoff = 80, orgdb){
+##     if(length(mirids) == 0L)
+##         return(NULL)
+##     else {
+##         tmp <- do.call(rbind, lapply(mirids, function(x) mirdbdf[mirdbdf[,1] %in% x & mirdbdf[,3] >= cutoff,1:2]))
+##         names(tmp) <- c("miR","REFSEQ")
+##         tmp$SYMBOL <- mapIds(orgdb, tmp$REFSEQ, "SYMBOL","ACCNUM")
+##         return(tmp)
+##     }
+## }
+
+## mirFun <- function(mirlst, mirdbdf, funmir, orgdb, elist, functional = TRUE, cutoff = 80){
+##     mirs <- lapply(mirlst, function(x) elist$genes[x,])
+##     if(functional)
+##         mirs <- lapply(mirs, function(x) x[x %in% funmir])
+##     outlst <- lapply(mirs, lilfun, mirdbdf = mirdbdf, cutoff = cutoff, orgdb = orgdb)
+##     outlst
+## }
+
+## outputMirs <- function(mirlst, nam, contrast){
+##     wb <- createWorkbook()
+##     shtnames <- gsub(" ", "_", colnames(contrast))[sapply(mirlst, function(x) !is.null(x))]
+##     mirlst <- mirlst[sapply(mirlst, function(x) !is.null(x))]
+##     for(i in shtnames) addWorksheet(wb, i)
+##     for(i in seq(along = mirlst)) writeData(wb, i, mirlst[[i]])
+##     saveWorkbook(wb, nam, TRUE)
+## }
+
+## outputMirs(mirFun(exmirs, mirdb, funcmir, org.Hs.eg.db, ve), "Henderson_pid1638_exosome_functional_mir_mapping.xlsx", contrast)
+## outputMirs(mirFun(exmirs, mirdb, funcmir, org.Hs.eg.db, ve, FALSE), "Henderson_pid1638_exosome_all_mir_mapping.xlsx", contrast)
+## outputMirs(mirFun(basmirs, mirdb, funcmir, org.Hs.eg.db, vb), "Henderson_pid1638_basophil_functional_mir_mapping.xlsx", contrast)
+## outputMirs(mirFun(basmirs, mirdb, funcmir, org.Hs.eg.db, vb, FALSE), "Henderson_pid1638_basophil_all_mir_mapping.xlsx", contrast)
+
+## outputMirs(mirFun(exmirs, mirdb, funcmir, org.Hs.eg.db, ve, cutoff = 90), "Henderson_pid1638_exosome_functional_mir_mapping_90.xlsx", contrast)
+## outputMirs(mirFun(exmirs, mirdb, funcmir, org.Hs.eg.db, ve, FALSE, cutoff = 90), "Henderson_pid1638_exosome_all_mir_mapping_90.xlsx", contrast)
+## outputMirs(mirFun(basmirs, mirdb, funcmir, org.Hs.eg.db, vb, cutoff = 90), "Henderson_pid1638_basophil_functional_mir_mapping_90.xlsx", contrast)
+## outputMirs(mirFun(basmirs, mirdb, funcmir, org.Hs.eg.db, vb, FALSE, cutoff = 90), "Henderson_pid1638_basophil_all_mir_mapping_90.xlsx", contrast)
+
+## Theo needs some faked up data for iPathwayGuide, ontaining all the genes on the array with 0 logFC and 1 adj p-val for
+## those genes that are not targets, and a 1 or -1 logFC and 0.049 p-val for those that are. And the sign of the logFC opposite
+## to the sign for the miRNA logFC
+
+## microarray is a clariom s human, so we use that as the basis
+## library(clariomshumantranscriptcluster.db)
+## blank <- data.frame(SYMBOL = keys(clariomshumantranscriptcluster.db, "SYMBOL"),
+##                     ENTREZ  = mapIds(clariomshumantranscriptcluster.db,
+##                                      keys(clariomshumantranscriptcluster.db, "SYMBOL"), "ENTREZID","SYMBOL"),
+##                     logFC = 0, adjPVal = 1)
+
+## makeBlank <- function(blankdf, excelwb, nam, fitobj, contmat){
+##     wb <- createWorkbook()
+##     shts <- getSheetNames(excelwb)
+##     for(i in 1:ncol(contmat)){
+##         tt <- topTable(fitobj, i, Inf, p.value = 0.05)
+##         sht <- gsub(" ", "_", colnames(contmat)[i])
+##         if(nrow(tt) == 0L | !sht %in% shts) next
+##         else {
+##             extab <- read.xlsx(excelwb, sht)
+##             extab <- extab[extab$SYMBOL %in% blank$SYMBOL,]
+##             tt <- tt[tt$genes %in% extab$miR,]
+##             extablst <- split(extab, extab$miR)
+##             subdflst <- lapply(names(extablst), function(x){
+##                 row <- which(tt$genes %in% x)
+##                 subdf <- blankdf[extablst[[x]]$SYMBOL,]
+##                 subdf$logFC <- sign(tt$logFC[row]) * -1
+##                 subdf$adjPVal <- tt[row,"adj.P.Val"]
+##                 return(subdf)})
+##         }
+##         blank <- rbind(blankdf, do.call(rbind, subdflst))
+##         addWorksheet(wb, sht)
+##         writeData(wb, sht, blank)
+##     }
+##     saveWorkbook(wb, nam, TRUE)
+## }
+
+## makeBlank(blank, "Henderson_pid1638_exosome_functional_mir_mapping.xlsx",
+##           "Henderson_pid1638_exosome_iPathway_functional_80.xlsx", exvfit2, contrast)
+## makeBlank(blank, "Henderson_pid1638_exosome_functional_mir_mapping_90.xlsx",
+##           "Henderson_pid1638_exosome_iPathway_functional_90.xlsx", exvfit2, contrast)
+## makeBlank(blank, "Henderson_pid1638_exosome_all_mir_mapping.xlsx",
+##           "Henderson_pid1638_exosome_iPathway_all_80.xlsx", exvfit2, contrast)
+## makeBlank(blank, "Henderson_pid1638_exosome_all_mir_mapping_90.xlsx",
+##           "Henderson_pid1638_exosome_iPathway_all_90.xlsx", exvfit2, contrast)
+## makeBlank(blank, "Henderson_pid1638_basophil_functional_mir_mapping.xlsx",
+##           "Henderson_pid1638_basophil_iPathway_functional_80.xlsx", basvfit2, contrast)
+## makeBlank(blank, "Henderson_pid1638_basophil_functional_mir_mapping_90.xlsx",
+##           "Henderson_pid1638_basophil_iPathway_functional_90.xlsx", basvfit2, contrast)
+## makeBlank(blank, "Henderson_pid1638_basophil_all_mir_mapping.xlsx",
+##           "Henderson_pid1638_basophil_iPathway_all_80.xlsx", basvfit2, contrast)
+## makeBlank(blank, "Henderson_pid1638_basophil_all_mir_mapping_90.xlsx",
+##           "Henderson_pid1638_basophil_iPathway_all_90.xlsx", basvfit2, contrast)
+
+corFun <- function(malst, cont, desgn, cordat, whichcomp){
+    tt <- topTable(malst, whichcomp, Inf, p.value = 0.1)
+    firstgroup <- cordat[as.character(tt$genes),desgn %*% cont[,whichcomp] > 0, drop = FALSE]
+    secondgroup <- cordat[as.character(tt$genes),desgn %*% cont[,whichcomp] < 0, drop = FALSE]
+    nam <- strsplit(colnames(cont)[whichcomp], " vs ")[[1]]
+    colnames(firstgroup) <- rep(nam[1], ncol(firstgroup))
+    colnames(secondgroup) <- rep(nam[2], ncol(secondgroup))
+    out <- data.frame(genes = tt$genes, firstgroup, secondgroup, check.names = FALSE)
+    out
+}
+
+wb <- createWorkbook()
+for(i in seq_len(ncol(contrast))) {
+    if(nrow(topTable(basvfit2, i, Inf, p.value = 0.1)) > 0){
+        sht <- gsub(" ", "_", colnames(contrast)[i])
+        addWorksheet(wb, sht)
+        writeData(wb, sht, corFun(basvfit2, contrast, design, vbplot, i))
+    }
+}
+saveWorkbook(wb, "Henderson_pid1638_basophil_plotting_data.xlsx", TRUE)
+
+wb <- createWorkbook()
+for(i in seq_len(ncol(contrast))) {
+    if(nrow(topTable(exvfit2, i, Inf, p.value = 0.1)) > 0){
+        sht <- gsub(" ", "_", colnames(contrast)[i])
+        addWorksheet(wb, sht)
+        writeData(wb, sht, corFun(exvfit2, contrast, design, veplot, i))
+    }
+}
+saveWorkbook(wb, "Henderson_pid1638_exosome_plotting_data.xlsx", TRUE)
+
+
+## Extra stuff 2019/12/18
+
+## 1.) recreate plots in Figure Basophil Sample.docx that Taha sent
+
+if(!file.exists("extra_plots")) dir.create("extra_plots")
+
+## basophil count by response
+tahadat <- read.xlsx("Data for Jim.xlsx")
+tahadat$nrcr <- factor(ifelse(tahadat$Response.Group == "NR", "NR", "R"), c("R","NR"))
+tahadat$Response.Group <- factor(tahadat$Response.Group, c("CR","PR","NR"))
+tahadat$inmir <- gsub(" ", ".", tahadat[,1]) %in% paste("Subject", unique(samps2$Subject), sep = ".")
+names(tahadat)[15] <- "Basophils"
+
+## function to get Welch CI
+
+cifun <- function(x, outcome, split.by){
+    lst <- split(x[,outcome], x[,split.by])
+    cis <- lapply(lst, function(x) {
+        mn <- mean(x)
+        stderr <- sqrt(var(x)/length(x))
+        cint <- qt(c(0.025, 0.975), length(x)-1)
+        cint <- mn + cint * stderr
+        cint})
+    return(list(samps = lst, means = sapply(lst, mean), cis = cis))
+}
+
+plotWithCi <- function(x, outcome, split.by, p1 = NULL, p2 = NULL, cex = 1.5, ...){
+    levs <- levels(x[,split.by])
+    op <- par(mar = par()$mar + c(0,2,0,0))
+    plot(c(1:length(levs)), rep(1, length(levs)), type = "n", xaxt = "n", ylim = c(-5,60), xlim = c(0,length(levs)+1),,
+         xlab = "", ylab = expression(paste("Basophil count (cells/", mu, "L)")),
+         yaxt = "n", cex.lab = cex, ...)
+    axis(1, at = 1:length(levs), levs, cex.axis = cex, lwd = 2)
+    axis(2, at = seq(0,60,10), seq(0,60,10), cex.axis = cex, las = 2, lwd = 2)
+    box(lwd = 2, bty = "l")
+    z <- cifun(x, outcome, split.by)
+    pchlst <- split(x[,"inmir"], x[,split.by])
+    startat <- 1:length(levs) - 0.2
+    endat <- 1:length(levs) + 0.2
+    if(length(levs) == 3) pchs <- c(16, 10, 1) else pchs <- c(16, 1)
+    points(jitter(rep(1, length(z$samps[[1]])), 3), z$samps[[1]], pch = pchs[1], col = as.numeric(pchlst[[levs[1]]]) + 1, cex = cex, lwd = 3)
+    points(jitter(rep(2, length(z$samps[[2]])), 3), z$samps[[2]], pch = pchs[2], col = as.numeric(pchlst[[levs[2]]]) + 1, cex = cex, lwd = 3)
+    if(length(levs) == 3) points(jitter(rep(3, length(z$samps[[3]])), 3), z$samps[[3]], pch = pchs[3], col = as.numeric(pchlst[[levs[3]]]) + 1,
+                                 cex = cex, lwd = 3)
+    segments(startat, z$means, endat, z$means, lwd = 3)
+    arrows(1:length(levs), sapply(z$cis, "[", 1), 1:length(levs), sapply(z$cis, "[", 2), angle = 90, length = 0.15, code = 3, lwd = 3)
+    par(op)
+}
+
+
+## first two figures
+png("extra_plots/Henderson_pid1638_figure_A.png", 480, 800)
+plotWithCi(tahadat, "Basophils", "nrcr", bty = "l", yaxs = "i", cex = 2)
+op <- par(xpd = TRUE)
+segments(1,58,2,58, lwd = 2)
+text(1.5, 58.5, "P=0.005", c(0.5, 0), cex = 2)
+par(op)
+dev.off()
+
+png("extra_plots/Henderson_pid1638_figure_B.png", 480, 800)
+op <- par(xpd = TRUE)
+plotWithCi(tahadat, "Basophils", "Response.Group", bty = "l", yaxs = "i", cex = 2)
+segments(1:2, c(58.5, 55), c(3,3), c(58.5, 55), lwd = 2)
+text(c(2, 2.5), c(59, 55.5), c("P=0.006","P=0.34"), c(0.5, 0), cex = 2)
+par(op)
+dev.off()
+
+## figure C
+png("extra_plots/Henderson_pid1638_figure_C.png", 700, 800)
+op <- par(xpd = TRUE, mar = par()$mar + c(0,2,0,0))
+aucsum <- rowSums(tahadat[,2:13])
+baso <- tahadat$Basophils
+aucfit <- lm(aucsum~baso)
+plot(tahadat$Basophils, aucsum, pch = 1, lwd = 3, col = as.numeric(tahadat$inmir)+1, bty = "l", xaxs = "i", yaxs = "i",
+     xlim = c(0, 60), ylim = c(-100, 400), ylab = "AUC (week 0-12)", xlab = expression(paste("Basophil count (cells/", mu, "L)")),
+     cex = 2, cex.axis = 2, cex.lab = 2)
+box(lwd = 2, bty = "l")
+par(op)
+abline(aucfit, lwd = 3)
+newx <- seq(min(tahadat$Basophils), max(tahadat$Basophils), by = 1)
+confidence.interval <- predict(aucfit, newdata = data.frame(baso = newx), interval = "confidence", level = 0.95)
+lines(newx, confidence.interval[,2], lty = 2, lwd = 2)
+lines(newx, confidence.interval[,3], lty = 2, lwd = 2)
+abline(h = 0, lty = 3, lwd = 2)
+text(40, 400, expression(paste(r^2, "=0.33,P=0.007")), c(0.5,1),cex = 2)
+dev.off()
+        
+## Figure D
+
+library(ROC)
+roc <- rocdemo.sca(abs(as.numeric(tahadat$nrcr)-2), tahadat$Basophils, function(x, thresh) 1 - dxrule.sca(x, thresh))
+
+png("extra_plots/Henderson_pid1638_figure_D.png", 700, 800)
+op <- par(xpd = TRUE, mar = par()$mar + c(0,2,0,0))
+plot(100*roc@spec, 100*(1 - roc@sens), xlab = "100% - Specificity%", ylab = "Sensitivity%", bty = "l", xaxs = "i", yaxs = "i",
+     cex = 2, cex.axis = 2, cex.lab = 2, type = "b", pch = 16, lwd = 2)
+box(lwd = 2, bty = "l")
+par(op)
+abline(1,1, lty = 2, lwd = 2)
+text(3, 100, "P=0.044",  c(0,1),cex = 2)
+dev.off()
+
+## Figure E
+
+## need a mixed model
+library(lme4)
+tahalong <- data.frame(Subject = factor(rep(tahadat[,1], 13)),
+                       Time = factor(rep(0:12, each = nrow(tahadat))),
+                       UAS = unlist(tahadat[,2:14]),
+                       Baso = factor(rep(tahadat[,16], 13)))
+tahalong <- tahalong[!apply(tahalong, 1, function(x) any(is.na(x))),]
+
+lmefit <- lmer(UAS ~ 0 + Time:Baso + (1|Subject), tahalong)
+
+
+lmedf <- as.data.frame(summary(lmefit)$coefficients)
+lmedf$Up <- rowSums(lmedf[,1:2])
+lmedf$Dn <- lmedf[,1] - lmedf[,2]
+
+png("extra_plots/Henderson_pid1638_figure_E.png", 700, 800)
+op <- par(mar = par()$mar + c(3,2,0,0))
+plot(1,1, type = "n", bty = "l", yaxs = "i", cex.axis = 1.5, cex.lab = 2, xlab = "",
+     ylab = expression(Mean~UAS7 %+-% SE), xlim = c(0,12), ylim = c(0,42))
+points(0:12, lmedf[1:13,1], pch = 16, cex = 1.5)
+lines(0:12, lmedf[1:13,1], lty = 1, lwd = 2)
+points(0:12, lmedf[14:26,1], pch = 1, cex = 1.5)
+lines(0:12, lmedf[14:26,1], lty = 2, lwd = 2)
+op <- par(xpd = TRUE)
+arrows(c(0,6,12), rep(-2, 3), c(0,6,12), rep(-4,3),code = 1, length = 0.1)
+mtext("Time (weeks)", 1, 6,cex = 2 )
+par(op)
+arrows(0:12, lmedf$Up, 0:12, lmedf$Dn, length = 0.15, angle = 90, code = 3)
+legend("topright", c("Basophil-high","Basophil-low"), pch = c(16,1), lty = 1:2, cex = 1.5, bty = "n")
+dev.off()
+
+## ggplot version 
+png("extra_plots/Henderson_pid1638_figure_E_spline.png", 700, 800)
+tahalong$Time <- as.numeric(as.character(tahalong$Time))
+ggplot(tahalong, aes(Time, UAS, colour = Baso)) + stat_smooth(method = "lm", formula = y~ns(x, 2)) +
+    labs(x = "Time (weeks)", y = expression(Mean~UAS7 %+-% SE)) + scale_x_continuous(breaks = seq(0,12,1)) +
+    scale_colour_manual(values = c("red","blue"), name = "Basophil") + theme_minimal()
+tahalong$Time <- factor(tahalong$Time)
+dev.off()
+
+## heatmap, only significant miRNAs from CR v NR, Day1, Exo and Baso
+basgns <- topTable(basvfit2, 1, Inf, p.value = 0.05)
+exogns <- topTable(exvfit2, 1, Inf, p.value = 0.05)
+
+hMap <- function(gns, mat, elist, sampdf, means = FALSE){
+    colind <- grep("Day1$", sampdf$combo)
+    mat <- mat[,colind]
+    sampdf <- sampdf[colind,]
+    ind <- match(gns[,1], row.names(mat))
+    mat <- mat[ind,]
+    colnames(mat) <- as.character(sampdf$SubjectCombo)
+    if(means) {
+        mat <- cbind(rowMeans(mat[,grep("CR", colnames(mat))]),
+                 rowMeans(mat[,grep("NR", colnames(mat))]))
+        colnames(mat) <- c("CR","NR")
+    } else {
+        mat <- t(scale(t(mat*elist$weights[ind,colind])))
+        mat <- mat[,order(sampdf$AdjDay, sampdf$Outcome)]
+    }
+    nam <- ifelse(means, "Mean expression", "z-score")
+    Heatmap(mat, cluster_columns = FALSE, show_row_names = FALSE, name = nam)
+    invisible(mat)
+}
+
+pdf("extra_plots/Henderson_pid1638_Day1_CRvNR_heatmaps.pdf")
+hMap(basgns, vbplot, vb, basosamps)
+hMap(basgns, vbplot, vb, basosamps, TRUE)
+hMap(exogns, veplot, ve, exosamps)
+hMap(exogns, veplot, ve, exosamps, TRUE)
+dev.off()
+
+## Taha wants the z-scores to plot himself
+wb <- createWorkbook()
+addWorksheet(wb, "basophils")
+addWorksheet(wb, "exosomes")
+z <- hMap(basgns, vbplot, vb, basosamps)
+writeData(wb, "basophils", z, rowNames = TRUE)
+z <- hMap(exogns, veplot, ve, exosamps)
+writeData(wb, "exosomes", z, rowNames = TRUE)
+saveWorkbook(wb, "extra_plots/Henderson_pid1638_heatmap_data.xlsx", TRUE)
+
+
+## Taha wants different plots of miR vs UAS7
+
+cutNPlot2 <- function(sampsdf, vobj, uasdat, topdf, points = TRUE, giggly = TRUE, extranam, justdat = FALSE, meanormed = "median"){
+    gns <- row.names(topdf)
+    vdat <- vobj$E[gns, grep("CR Day1$|NR Day1$", sampsdf$combo)]
+    vcuts <- switch(meanormed,
+                    "median" = apply(vdat, 1, function(x) ifelse(x < median(x, na.rm = TRUE), "low","high")),
+                    "mean" = apply(vdat, 1, function(x) ifelse(x < mean(x, na.rm = TRUE), "low","high")),
+                    stop("use mean or median, fool"))
+    ggdat <- do.call(rbind, lapply(seq(along = gns),
+                                   function(x) data.frame(Week = rep(uasdat$Week, ncol(uasdat)-1),
+                                                          miRval = vdat[x,][col(uasdat[,-1])],
+                                                          Expression = vcuts[,x][col(uasdat[,-1])],
+                                                          value = unlist(uasdat[,-1]),
+                                                          Subject = factor(gsub("Subject\\.", "", colnames(uasdat)[-1][col(uasdat[,-1])])),
+                                                          miRNA = rep(as.character(topdf$genes)[x], length(as.vector(uasdat[,-1]))))))
+    lmelst <- split(ggdat, ggdat$miRNA)
+    lmelst <- lapply(lmelst, function(x) {x$Week <- factor(x$Week); return(x)})
+    lmefitlst <- lapply(lmelst, function(x) lmer(value~0 + Week:Expression + (1|Subject), x))
+    pvals <- sapply(lmefitlst, function(x) anova(x, update(x, .~. - Week:Expression + Week))[2,8])
+    pvals <- ifelse(round(pvals, 3) == 0L, "<0.001", ifelse(pvals > 0.05, round(pvals, 2), round(pvals, 3)))
+    pvals <- paste0(names(pvals), "\nP=", pvals)
+    ggdat$miRNA <- pvals[ggdat$miRNA]
+    if(justdat) return(ggdat)
+    if(giggly){
+        g <- ggplot(ggdat, aes(Week, value, colour = Expression)) + 
+            stat_smooth(method = "lm", formula = y~ns(x, 2)) + facet_wrap(~miRNA) +
+            ylab("UAS7")
+        if(points)
+            g <- g + geom_point()
+        return(g)
+    } else {
+        lmedflst <- lapply(lmefitlst, function(x){
+            tmp <- as.data.frame(summary(x)$coefficients)
+            tmp$Up <- rowSums(tmp[,1:2])
+            tmp$Dn <- tmp[,1] - tmp[,2]
+            return(tmp)
+        })
+        for(i in seq(along = lmedflst)){
+            if(!file.exists("extra_plots/section_3.1")) dir.create("extra_plots/section_3.1", recursive = TRUE)
+            png(paste0("extra_plots/section_3.1/Henderson_pid1638_UASvsTime_", extranam, "_", names(lmedflst)[i], ".png"),
+                480, 800)
+            op <- par(mar = par()$mar + c(3,2,0,0))
+            plot(1,1, type = "n", bty = "l", yaxs = "i", ylim = c(0,50), xlim = c(0,12),
+                 xlab = "", ylab = "UAS7", main = names(lmedflst)[i], cex.axis = 2, cex.lab = 2,
+                 cex.main = 2)
+            points(0:12, lmedflst[[i]][1:13,1], pch = 16, cex = 2)
+            lines(0:12, lmedflst[[i]][1:13,1], lty = 1, lwd = 2)
+            points(0:12, lmedflst[[i]][14:26,1], pch = 1, cex = 2, lwd = 2)
+            lines(0:12, lmedflst[[i]][14:26,1], lty = 2, lwd = 2)
+            box(las = 2, bty = "l")
+            legend("topleft", sapply(strsplit(pvals, "\n"), "[", 2)[i], bty = "n", cex = 2)
+            op <- par(xpd = TRUE)
+            arrows(c(0,6,12), rep(-2.5, 3), c(0,6,12), rep(-4,3),code = 1, length = 0.1, lwd = 2)
+            mtext("Time (weeks)", 1, 6,cex = 2 )
+            par(op)
+            arrows(0:12, lmedflst[[i]]$Up, 0:12, lmedflst[[i]]$Dn, length = 0.15, angle = 90, code = 3, lwd = 2)
+            legend("topright", c("High expression","Low expression"), pch = c(16,1), lty = 1:2, cex = 1.5, bty = "n")
+            dev.off()
+        }
+    }
+}
+
+        
+        
+        
+## section 3.1 plots, adjusted
+
+pdf("extra_plots/Henderson_pid1638_section3.1_withpoints.pdf")
+cutNPlot2(basosamps, vb, uas, topTable(basvfit2, 1, Inf, p.value = 0.1)) +
+    scale_x_continuous(breaks = seq(0,12,2)) + scale_colour_manual(values = c("red","blue")) + theme_minimal()
+cutNPlot2(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.1)[1:11,]) +
+    scale_x_continuous(breaks = seq(0,12,2)) + scale_colour_manual(values = c("red","blue")) + theme_minimal()
+cutNPlot2(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.1)[12:17,]) +
+    scale_x_continuous(breaks = seq(0,12,2)) + scale_colour_manual(values = c("red","blue")) + theme_minimal()
+dev.off()
+
+pdf("extra_plots/Henderson_pid1638_section3.1_nopoints.pdf")
+cutNPlot2(basosamps, vb, uas, topTable(basvfit2, 1, Inf, p.value = 0.1), FALSE) +
+    scale_x_continuous(breaks = seq(0,12,2)) + scale_colour_manual(values = c("red","blue")) + theme_minimal()
+cutNPlot2(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.1)[1:11,], FALSE) +
+    scale_x_continuous(breaks = seq(0,12,2)) + scale_colour_manual(values = c("red","blue")) + theme_minimal()
+cutNPlot2(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.1)[12:17,], FALSE) +
+    scale_x_continuous(breaks = seq(0,12,2)) + scale_colour_manual(values = c("red","blue")) + theme_minimal()
+dev.off()
+
+cutNPlot2(basosamps, vb, uas, topTable(basvfit2, 1, Inf, p.value = 0.1), TRUE, FALSE, "Basophil")
+cutNPlot2(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.1), TRUE, FALSE, "Exosomes")
+
+## Taha wants a plot with just the significant miRs, both sample types.
+
+z12 <- rbind(cutNPlot2(basosamps, vb, uas, topTable(basvfit2, 1, Inf, p.value = 0.05), justdat = TRUE),
+             cutNPlot2(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.05), justdat = TRUE))
+z12$miRNA <- gsub("hsa-","", z12$miRNA)
+## this will need to be reordered later for Taha
+## z12$miRNA <- factor(z12$miRNA, levels = c("hsa-miR-1236-3p\nP=0.73","miR-6819-3p\nP=0.1","hsa-miR-4664-3p\nP=0.73",
+##                                           "hsa-miR-6499-5p\nP=<0.001","hsa-miR-7848-3p\nP=<0.001","hsa-miR-7851-3p\nP=0.004",
+##                                           "hsa-miR-887-5p\nP=0.07","miR-669c-3p\nP=0.024","hsa-miR-141-3p\nP=0.08"))
+
+pdf("extra_plots/Henderson_pid1638_section3.1_only_sig.pdf")
+ggplot(z12, aes(Week, value, colour = Expression)) + stat_smooth(method = "lm", formula = y~ns(x, 2)) + facet_wrap(~miRNA, scales = "free") +
+    ylab("UAS7") + scale_x_continuous(breaks = seq(0,12,4)) + scale_colour_manual(values = c("red","blue")) + theme_tufte() +
+    scale_y_continuous(breaks = seq(0,42, length.out = 7),limits =  c(-5,40)) +
+   theme(axis.title = element_text(size = 20), axis.text = element_text(size = 15), strip.text = element_text(size = 12),
+          panel.grid = element_blank(), axis.line = element_line())
+dev.off()
+
+z12mean <- rbind(cutNPlot2(basosamps, vb, uas, topTable(basvfit2, 1, Inf, p.value = 0.05), justdat = TRUE, meanormed = "mean"),
+             cutNPlot2(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.05), justdat = TRUE, meanormed = "mean"))
+z12mean$miRNA <- gsub("hsa-","", z12mean$miRNA)
+
+pdf("extra_plots/Henderson_pid1638_section3.1_only_sig_meancutoff.pdf")
+ggplot(z12mean, aes(Week, value, colour = Expression)) + stat_smooth(method = "lm", formula = y~ns(x, 2)) + facet_wrap(~miRNA, scales = "free") +
+    ylab("UAS7") + scale_x_continuous(breaks = seq(0,12,4)) + scale_colour_manual(values = c("red","blue")) + theme_tufte() +
+    scale_y_continuous(breaks = seq(0,42, length.out = 7),limits =  c(-5,40)) +
+    theme(axis.title = element_text(size = 20), axis.text = element_text(size = 15), strip.text = element_text(size = 12),
+          panel.grid = element_blank(), axis.line = element_line())
+dev.off()
+
+
+
+
+## Glimma type plots, adjusted
+
+glimmaplot <- function(gns, mat, sampdf, which.one){
+    ## just want the CR Day1 and NR Day 1 samples
+    ind <- sampdf$combo %in% c("CR Day1","NR Day1")
+    op <- par(mar = par()$mar + c(0,2,0,0))
+    mir <- gns[which.one,1]
+    combo <- sampdf$combo[ind]
+    val <- mat[mir,ind]
+    plot(c(0,3), range(val), type = "n", bty = "l", xlab = "", ylab = paste(mir, "Expression (logCPM)"),
+         cex.axis = 2, cex.lab = 2, xaxt = "n", las = 1, yaxs = "i", ylim = c(min(val) - max(val)/10, max(val)*1.1))
+    axis(1, 1:2, c("CR","NR"), cex.axis = 2)
+    box(lwd = 2, bty = "l")
+    cr <- val[combo %in% "CR Day1"]
+    nr <- val[combo %in% "NR Day1"]
+    mr <- mean(cr)
+    mnr <- mean(nr)
+    sds <- c(sd(cr), sd(nr))
+    points(jitter(rep(1, length(cr))), cr, pch = 16, cex = 3)
+    points(jitter(rep(2, length(nr))), nr, pch = 1, cex = 3, lwd = 2)
+    segments((1:2) - 0.2, c(mr, mnr), (1:2) + 0.2, lwd = 3)
+    arrows(1:2, c(mr, mnr) - sds, 1:2, c(mr, mnr) + sds, length = 0.1, angle = 90, code = 3, lwd = 2)
+    p <- gns[which.one,"adj.P.Val"]
+    rndval <- if(round(p, 3) == 0L) sprintf("%1.2e", p) else round(p, 3)
+    legend("top", paste0("P=", rndval), bty = "n", cex = 2)
+    par(op)
+}
+
+## Taha doesn't like the batch corrected data
+vbplot2 <- vb$E
+row.names(vbplot2) <- row.names(vbplot)
+veplot2 <- ve$E
+row.names(veplot2) <- row.names(veplot)
+
+for(i in seq_len(nrow(basgns))){
+    png(paste0("extra_plots/Henderson_pid1638_mir_", basgns[i,1], "_expression_basophil.png"), 480, 800)
+    glimmaplot(basgns, vbplot2, basosamps, i)
+    dev.off()
+}
+
+for(i in seq_len(nrow(exogns))){
+    png(paste0("extra_plots/Henderson_pid1638_mir_", exogns[i,1], "_expression_exosome.png"), 480, 800)
+    glimmaplot(exogns, veplot2, exosamps, i)
+    dev.off()
+}
+
+## Taha wants these data to do his own plots
+
+makeDF <- function(gns, mat, sampdf){
+    colnames(mat) <- sampdf$SubjectCombo
+    ind <- sampdf$combo %in% c("CR Day1","NR Day1")
+    vals <- mat[gns$genes, ind]
+    mns <- cbind(rowMeans(vals[,grep("CR", colnames(vals))]),
+                 rowMeans(vals[,grep("NR", colnames(vals))]))
+    colnames(mns) <- c("R mean","NR mean")
+    sds <- cbind(apply(vals[,grep("CR", colnames(vals))], 1, sd),
+                 apply(vals[,grep("NR", colnames(vals))], 1, sd))
+    colnames(sds) <- c("R stdev","NR stdev")
+    data.frame(vals, mns, sds, p.value = gns$adj.P.Val)
+}
+
+    
+    
+    
+
+wb <- createWorkbook()
+addWorksheet(wb, "basophils")
+addWorksheet(wb, "exosomes")
+writeData(wb, "basophils", makeDF(basgns, vbplot2, basosamps), rowNames = TRUE)
+writeData(wb, "exosomes", makeDF(exogns, veplot2, exosamps), rowNames = TRUE)
+saveWorkbook(wb, "extra_plots/Henderson_pid1638_significant_miRNA_data_for_plotting.xlsx", TRUE)
+
+
+
+
+
+```
+
+```{r, echo = FALSE, results = "asis"}
+
+BiocStyle::markdown()
+
+```
+
+
+
+
+# Introduction
+
+This is an analysis of miRNA-Seq data from subjects with uticaria who were treated
+with omalizumab in three monthly injections. The subjects were grouped
+according to their UAS7 itch score into complete responders and
+non-responders, and the goal is to detect miRNA transcripts that
+change according to the outcome, as well as correlate the miRNA
+transcripts with other phenotypic results.
+
+Blood was drawn from each subject at baseline, approximately 14 days
+later, and again approximately 90 days later. Both exosomes and
+basophils were extracted and assayed for miRNA transcript abundances
+using Qiagen's QIAseq UMI method. Samples and timepoints for this
+analysis are presented below.
+
+**Please note that this is an updated version of the analysis, after
+removing Subject 16. Also note that this document is truncated;
+previously it included miRNA-mRNA correlation analyses that are not
+being used, so we removed that portion.**
+
+```{r, echo = FALSE, results = "asis"}
+
+print(xtable(basosamps[,4:7], caption = "Samples used in this analysis.",
+             digits = 0),
+      include.rownames = FALSE, type = "HTML")
+             
+
+```
+The actual day of the blood draw is approximately 14 and 90 days; we
+converted all the actual days to an adjusted day of 14 and 90 for
+linear modeling.
+
+# Exploratory data analysis
+
+We first present a table of read depth for each sample, by type.
+
+```{r, echo = FALSE, results = "asis"}
+
+print(xtable(data.frame(basosamps[,c(4,6,7)], Counts = vb$targets$lib.size/1e6,
+                        Weights = vb$targets$sample.weights), digits = rep(c(0,2), c(4,2)),
+             caption = paste("Library depth and sample weights for basophil samples. The counts",
+                             "column presents the total UMI counts per sample (in millions), and the",
+                             "weights are used in the linear modeling step (see below).")),
+      type = "html", include.rownames = FALSE)
+                       
+                       
+
+```
+
+In the above table we present the total UMI counts (in millions). We
+have somewhere between 1.5 - 4 million UMI counts, which is a
+reasonable library depth. By using UMI counts rather than raw counts
+we are able to distinguish unique miRNA transcript counts from PCR
+duplicates, which helps reduce any bias.
+
+```{r, echo = FALSE, results = "asis"}
+
+print(xtable(data.frame(exosamps[,c(4,6,7)], Counts = ve$targets$lib.size/1e6,
+                        Weights = ve$targets$sample.weights), digits = rep(c(0,2), c(4,2)),
+             caption = paste("Library depth and sample weights for exosome samples. The counts",
+                             "column presents the total UMI counts per sample (in millions), and the",
+                             "weights are used in the linear modeling step (see below).")),
+      type = "html", include.rownames = FALSE)
+                       
+                       
+
+```
+We get smaller library sizes for the exosome samples, somewhere
+between 0.8 - 2M UMI reads.
+
+
+To ensure that the data are of high quality, we first do some
+exploratory data analysis. One of the best QC plots is a principal
+components analysis (PCA) plot, which allows us to project high
+dimensional data into just a few dimensions in order to visualize any
+gross similarities (or differences) between samples. Ideally we expect
+the different groups (or subjects) to cluster together, indicating
+consistent similarity in miRNA expression. We generated PCA plots for
+the [basophil samples](glimma-plots/MDS-Plot_basophils.html)
+and the [exosomal samples](glimma-plots/MDS-Plot_exosomes.html). These
+plots are interactive; the top left plot shows the PCA plot, and the
+top right plot is a barplot showing how much variability is captured
+by each principal component. You can click on the barplot to visualize
+different principal components in the PCA plot. In addition, below the
+barplot are links that will change the color of the plotting symbols
+depending on the link you click. So if you want to color the samples
+by subject, or by day, or by response outcome, you can click any of
+those links.
+
+In general we see very little consistency between the response
+groups. There is some consistency between some of the subjects, but
+overall we don't see much in these plots to indicate that there is a
+consistent pattern of expression that defines these groups. This is
+not unexpected, as there are likely to be only a few miRNA transcripts
+that are changing expression consistently with the response.
+
+
+# Model fit and results
+To make these comparisons we use the Bioconductor edgeR and limma
+packages. Count data are not amenable to analysis using conventional
+linear regression because they are not normally distributed and have a
+strong dependence between the mean and variance. However, we can
+normalize to account for differences in library size (compute
+counts/million), and then convert to log<sub>2</sub> (logCPM), which
+will make the distribution of the data closer to a normal
+distribution. We can then compute observation-level weights, based on
+the mean-variance trend of the logCPM values and fit a weighted linear
+model. This is called a limma-voom transformation [@law:2014]. As part
+of the weight estimation we can also compute sample-specific weights
+based on how similar (or different) each sample is to others of the
+same type [@liu2015weight], which has been shown to improve power in
+both real and simulated data sets.
+
+By using conventional linear models we are also able to fit a linear
+mixed model, which allows us to account for the intra-subject
+correlation that occurs when we make repeated measures of each
+subject. We fit the weighted linear mixed model, and then computed
+empirical Bayes adjusted contrasts [@phipson2016robust] to test for
+differences between various time/outcome groups. We selected miRNA
+transcripts using a false discovery rate (FDR) of 0.1, meaning that we
+expect at most to have 10% false positives in the set of significant
+genes. 
+
+
+```{r, echo = FALSE, results = "asis"}
+
+sc <- function(x) x
+
+
+d.f <- data.frame(Comparison =  hwrite(colnames(contrast), table = FALSE, link = exorslts),
+                  "Number significant" = sapply(1:ncol(contrast), function(x) nrow(topTable(exvfit2, x, Inf, p.value = 0.1))),
+                  check.names = FALSE)
+
+print(xtable(d.f, caption = "Number of significant genes for exosomes at an FDR < 0.1."),
+      type = "html", include.rownames = FALSE, sanitize.text.function = sc, sanitize.colnames.function = sc)
+
+```
+The links in the above table will open an interactive document
+containing the results. At the top left is an MA plot, which shows the
+average logCPM (roughly the average expression level of the miRNA) on
+the horizontal axis, and the log fold change between the two groups on
+the vertical axis. Any differentially expressed gene will be colored
+red. If you hover over any plotting symbol, it will bring up a tooltip
+that shows some information about the gene represented by that point,
+as well as showing the logCPM values for all the samples in a plot to
+the top right. 
+
+Below the plots is a table, which can be sorted by clicking on any
+column header. By default it only shows 10 rows, but you can adjust
+that using the drop-down to the top left of the table. You can also
+search for anything in that table using the search box on the top
+right. If you click on any row, it will highlight the corresponding
+value in the top left plot as well as showing the expression levels in
+the top right plot.
+
+```{r, results = "asis"}
+
+d.f <- data.frame(Comparison =  hwrite(colnames(contrast), table = FALSE, link = basorslts),
+                  "Number significant" = sapply(1:ncol(contrast), function(x) nrow(topTable(basvfit2, x, Inf, p.value = 0.1))),
+                  check.names = FALSE)
+
+print(xtable(d.f, caption = "Number of significant genes for basophils at an FDR < 0.1."),
+      type = "html", include.rownames = FALSE, sanitize.text.function = sc, sanitize.colnames.function = sc)
+
+
+```
+##  UAS7 score over time, stratified by miRNA expression
+
+
+We can plot the relationship between UAS7 score and time, where we
+stratify by the underlying miRNA expression for those miRNAs that are
+differentially expressed at baseline. In other words, for each miRNA
+that is differentially expressed at baseline, we characterize each
+subject as having high or low expression (based on being higher or
+lower than the median expression level for that miRNA), and then plot
+the relationship between UAS7 score and time for each group of
+subjects. There are six differentially expressed miRNAs for the
+basophil samples, so we start with those data.
+
+```{r, fig.cap = cap, fig.height = 8}
+
+cutNPlot(basosamps, vb, uas, topTable(basvfit2, 1, Inf, p.value = 0.1))
+
+
+cap <- paste("UAS7 score versus time, stratified by miRNA expression levels in basophils. For",
+             "each miRNA we classify the subject as high or low, based on the miRNA",
+             "expression level at baseline. We then plot the relationship between UAS7",
+             "and time, stratified by the dichotimized miRNA expression level.")
+
+```
+
+There are 17 miRNAs differentially expressed for the exosomes, so we
+split into four plots.
+
+```{r, fit.cap = cap, fig.height = 8}
+
+cutNPlot(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.1)[1:11,])
+
+cap <- paste("UAS7 score versus time, stratified by miRNA expression levels in exosomes.",
+             "This is the first set of 11 miRNA transcripts.")
+
+
+```
+```{r, fit.cap = cap, fig.height = 8}
+
+cutNPlot(exosamps, ve, uas, topTable(exvfit2, 1, Inf, p.value = 0.1)[12:17,])
+
+cap <- paste("UAS7 score versus time, stratified by miRNA expression levels in exosomes.",
+             "This is the final set of 5 miRNA transcripts.")
+
+
+```
+
+
+Please note that there is some circularity to the logic behind these
+plots. We chose these miRNA transcripts because they are different
+between the CR and NR subjects, which were defined according to the
+UAS7 score. We then use the miRNA transcripts to re-define the
+subjects, but since the miRNA transcripts were selected using a
+classification based on the UAS7 score, it is not unexpected that
+these plots would then show a difference between UAS7 scores by time.
+
+## Relationship between miRNA expression and UAS7 score
+
+We can model miRNA expression as a function of UAS7 score, to see if
+there is a correlation between the two. To do this, we fit a
+model that includes a patient-level blocking factor to account for
+patient-specific miRNA expression levels. We also fit an interaction
+between miRNA expression and outcome status, which basically means
+that we plot two lines, one for the CR and one for the NR patients. 
+
+We present an example plot, below.
+
+```{r, fig.cap = cap, fig.height = 8}
+
+makePlot(topTable(exvfit2, 1), 1, exosamps, ve, exvfit2)
+
+cap <- paste("Plot of linear relationship between",  as.character(topTable(exvfit2, 1)[1,1]),
+             "and UAS7 score, by outcome. The black points and line are the CR subject",
+             "observations and regression line, and the red line and points are the NR",
+             "subjects and regression line. On the right side of the plot are the coefficients and",
+             "p-values for each regression line, plus the model coefficient of determination. The coefficients",
+             "can be interpreted as the log change in miRNA expression for every unit change in UAS7.",
+             "In this plot, the coefficient for the NR group is -0.19, so we can say that for a change",
+             "in UAS7 of about 5 for that group, we expect the miRNA expression to go down by about half.",
+             "In other words, for a unit change in UAS7, we expect the miRNA expression to go down by 0.19,",
+             "so for a change in 5 on UAS7, we expect the miRNA expression to go down by about 1 (-0.19 * 5 is almost 1)",
+             "and since the miRNA expression is on the log scale, this corresponds to a 50% reduction on the linear scale.",
+             "The p-value for the CR group tests for evidence that the slope of the line is different from",
+             "zero (e.g., there is evidence for a change in miRNA expression as UAS7 changes). The p-value",
+             "for the NR group is slightly different; we are testing for evidence that the slope for the NR",
+             "group is different than the slope for the CR group. In this example, the NR p-value is < 0.01, and",
+             "we cannot say that he slope of the CR is not zero, so we have evidence that this miRNA changes",
+             "expression as UAS7 varies. The coefficient of determination indicates how much of the variability",
+             "is explained by the regression lines, in this case 50%. We should also point out that the NR",
+             "fit may be affected by three high-leverage points in the lower right of the plot. Without those",
+             "three observations, the NR line would be almost the same as the CR line. Whether or not this",
+             "matters depends on how representative of the underlying population those three subjects are.")
+            
+
+```
+
+
+We output PDF versions of the above plot, for each contrast and each
+sample type, which are accessible using the links, below. We also
+output a set of plots where we only fit one regression line, in the
+second table below.
+
+```{r, results = "asis"}
+
+
+pdfdf <- data.frame(exosomes = hwrite(colnames(contrast), table = FALSE, link = paste0("pdfs/exosomes_", gsub(" ", "_", colnames(contrast)), ".pdf")),
+                    basophils = hwrite(colnames(contrast), table = FALSE, link = paste0("pdfs/basophils_", gsub(" ", "_", colnames(contrast)), ".pdf")))
+
+print(xtable(pdfdf, paste("Links to plots for each contrast, for each sample type.")), include.rownames = FALSE, type = "html",
+      sanitize.text.function = function(x) x)
+
+pdfdf2 <- data.frame(exosomes = hwrite(colnames(contrast), table = FALSE,
+                                       link = paste0("pdfs/exosomes_", gsub(" ", "_", colnames(contrast)), "_oneline.pdf")),
+                     basophils = hwrite(colnames(contrast), table = FALSE,
+                                        link = paste0("pdfs/basophils_", gsub(" ", "_", colnames(contrast)), "_oneline.pdf")))
+
+print(xtable(pdfdf2, paste("Links to plots for each contrast, for each sample type, one regression line.")), include.rownames = FALSE, type = "html",
+      sanitize.text.function = function(x) x)
+
+```
+
+## Heatmap of all data
+
+For heatmaps, we generally convert the data to z-scores (e.g., center
+and scale the data to have a mean of zero and a standard deviation of
+1). If we plot the logCPM values directly, the high and low expressing
+miRNAs will dominate the plot, and may obscure the changes within each
+miRNA. By using z-scores, the colors within each row can be
+interpreted as the divergence of a given sample from the mean
+expression (in units of standard deviations). While this is more
+difficult to interpret on a row-wise basis, the overall pattern of the
+heatmap is more interpretable. 
+
+The ordering of the columns and rows of a heatmap are usually dictated
+by a hierarchical clustering of the samples (for the columns) and the
+miRNAs (for the rows), where the hierarchical clustering attempts to
+group samples and genes based on how similar they are.  Since we
+already know that we have two groups and three time points, it is not
+that useful to cluster the columns, so we only cluster the rows. Given
+the number of transcripts being measured, it's not easy to make the
+row names visible, so we omit those for these plots. But do note that
+we can make a very tall pdf version with which you can see the row
+names if desired.
+
+
+```{r, fig.cap = cap, fig.height = 10}
+
+mat <- t(scale(t(veplot*ve$weights)))
+colnames(mat) <- as.character(basosamps$SubjectCombo)
+mat <- mat[,order(basosamps$AdjDay, basosamps$Outcome)]
+Heatmap(mat, cluster_columns = FALSE, show_row_names = FALSE, name = "z-score")
+
+cap <- paste("Heatmap of exosome data using z-scores. The colors for each",
+             "cell of the heatmap indicate how different that sample is, as compared",
+             "to the average of all samples for that miRNA transcript. Generally, if",
+             "there is a consistent pattern of differential expression between groups,",
+             "it would be clearly visible in this plot.")
+
+
+```
+
+In this plot there are very few discernable patterns, which should be
+expected given that we only have a few miRNA transcripts that are
+differentially expressed. An alternative is to plot only those miRNA
+transcripts that are differentially expressed in any contrast.
+
+```{r, fig.cap = cap, fig.height = 10}
+
+sigex <- unique(unlist(sapply(1:ncol(contrast), function(x) which(topTable(exvfit2, x, Inf, sort.by=  "none")$adj.P.Val < 0.1))))
+Heatmap(mat[sigex,], cluster_columns = FALSE, show_row_names = FALSE, name = "z-score")
+
+cap <- paste("Heatmap of exosome data using z-scores, significant genes only.",
+             "When we subset to just the miRNAs that are significant in one or more",
+             "contrasts, it is easier to see patterns of differential expression.")
+
+
+```
+
+
+
+```{r, fig.cap = cap, fig.height = 10}
+
+mat <- t(scale(t(vbplot*vb$weights)))
+colnames(mat) <- as.character(basosamps$SubjectCombo)
+mat <- mat[,order(basosamps$combo)]
+Heatmap(mat, cluster_columns = FALSE, show_row_names = FALSE, name = "z-score")
+
+cap <- paste("Heatmap of basophil data using z-scores. As with the",
+             "exosome data there isn't a clear pattern between the groups.")
+
+
+
+```
+
+```{r, fig.cap = cap, fig.height = 10}
+
+sigex <- unique(unlist(sapply(1:ncol(contrast), function(x) which(topTable(basvfit2, x, Inf, sort.by=  "none")$adj.P.Val < 0.1))))
+Heatmap(mat[sigex,], cluster_columns = FALSE, show_row_names = FALSE, name = "z-score")
+
+cap <- paste("Heatmap of basophil data using z-scores, significant genes only.",
+             "When we subset to just the miRNAs that are significant in one or more",
+             "contrasts, it is easier to see patterns of differential expression.")
+
+
+```
+
+
+## R packages used
+
+
+```{r, echo = FALSE}
+
+sessionInfo()
+
+```
+# References
